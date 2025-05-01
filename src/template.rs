@@ -1,6 +1,6 @@
-//! Cobalto Template Engine
+//! Cobalto Template Engine with Tailwind Support
 //!
-//! This module implements a Django-inspired template engine for Rust.
+//! This module implements a Django-inspired template engine for Rust, now with Tailwind integration.
 //!
 //! Workflow:
 //! 1. `render_template` loads the child template.
@@ -8,9 +8,9 @@
 //! 3. `parse_tokens` and `parse_nodes` build an AST of `Node`.
 //! 4. Child `Block` definitions and `Extends` tag are collected.
 //! 5. `merge_blocks` merges child blocks into the base template, replacing all matching blocks by name (supports multiple occurrences).
-//! 6. `render_nodes` walks the merged AST and outputs HTML, resolving variables, `if` conditions, and `for` loops.
+//! 6. `render_nodes` walks the merged AST and outputs HTML, resolving variables, `if` conditions, `for` loops, and Tailwind imports via `{% tailwind %}`.
 //!
-//! Runtime logging of internal operations is controlled via `set_display_logs`.
+//! Runtime logging is controlled via `set_display_logs`.
 
 use regex::Regex;
 use std::collections::HashMap;
@@ -39,7 +39,7 @@ macro_rules! tdebug {
 }
 
 /// Supported value types for template context
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum TemplateValue {
     String(String),
     Bool(bool),
@@ -94,11 +94,10 @@ pub enum Node {
         body: Vec<Node>,
     },
     Extends(String),     // {% extends "base.html" %}
+    Tailwind,            // {% tailwind %}
 }
 
 /// Tokenizes the template content into a Vec<Token>
-///
-/// Captures {{ }} and {% %} constructs, preserving other text.
 pub fn tokenize_template(content: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
     let re = Regex::new(r"(?s)(\{\{.*?\}\}|\{%.*?%\})").unwrap();
@@ -128,8 +127,6 @@ pub fn tokenize_template(content: &str) -> Vec<Token> {
 }
 
 /// Parses a sequence of Token into an AST of Node
-///
-/// Uses `parse_nodes` recursively; ends on matching `end_tags`.
 pub fn parse_tokens(tokens: &[Token]) -> Vec<Node> {
     let mut idx = 0;
     parse_nodes(tokens, &mut idx, &[])
@@ -167,8 +164,7 @@ fn parse_nodes(tokens: &[Token], idx: &mut usize, end_tags: &[&str]) -> Vec<Node
                     if *idx < tokens.len() {
                         if let Token::Tag(tt) = &tokens[*idx] {
                             if tt.trim() == "else" {
-                                *idx += 1;
-                                else_body = parse_nodes(tokens, idx, &["endif"]);
+                                *idx += 1; else_body = parse_nodes(tokens, idx, &["endif"]);
                             }
                         }
                     }
@@ -183,13 +179,15 @@ fn parse_nodes(tokens: &[Token], idx: &mut usize, end_tags: &[&str]) -> Vec<Node
                         *idx += 1;
                         let body = parse_nodes(tokens, idx, &["endfor"]);
                         *idx += 1; // skip endfor
-                        nodes.push(Node::For {
-                            var_name: parts[0].to_string(),
-                            list_name: parts[2].to_string(),
-                            body,
-                        });
+                        nodes.push(Node::For { var_name: parts[0].to_string(), list_name: parts[2].to_string(), body });
                         continue;
                     }
+                }
+                // Handle tailwind tag
+                if t == "tailwind" {
+                    nodes.push(Node::Tailwind);
+                    *idx += 1;
+                    continue;
                 }
                 // Unknown tag: skip
                 *idx += 1;
@@ -203,18 +201,14 @@ fn parse_nodes(tokens: &[Token], idx: &mut usize, end_tags: &[&str]) -> Vec<Node
 fn resolve_variable<'a>(name: &str, context: &'a HashMap<String, TemplateValue>) -> Option<&'a TemplateValue> {
     let mut current: Option<&TemplateValue> = None;
     for (i, key) in name.split('.').enumerate() {
-        if i == 0 {
-            current = context.get(key);
-        } else if let Some(TemplateValue::Object(map)) = current {
-            current = map.get(key);
-        } else {
-            return None;
-        }
+        if i == 0 { current = context.get(key); }
+        else if let Some(TemplateValue::Object(map)) = current { current = map.get(key); }
+        else { return None; }
     }
     current
 }
 
-/// Merges child blocks into base AST by matching block names (recursive)
+/// Merges child blocks into base AST by matching block names
 fn merge_blocks(nodes: &[Node], child_blocks: &HashMap<String, Vec<Node>>) -> Vec<Node> {
     nodes.iter().map(|node| match node {
         Node::Block { name, body } => {
@@ -237,6 +231,7 @@ fn merge_blocks(nodes: &[Node], child_blocks: &HashMap<String, Vec<Node>>) -> Ve
         Node::Text(t) => Node::Text(t.clone()),
         Node::Variable(v) => Node::Variable(v.clone()),
         Node::Extends(e) => Node::Extends(e.clone()),
+        Node::Tailwind => Node::Tailwind,
     }).collect()
 }
 
@@ -247,9 +242,7 @@ fn render_nodes(nodes: &[Node], context: &HashMap<String, TemplateValue>) -> Str
         match node {
             Node::Text(t) => out.push_str(t),
             Node::Variable(name) => {
-                if let Some(val) = resolve_variable(name, context) {
-                    out.push_str(&val.as_string());
-                }
+                if let Some(val) = resolve_variable(name, context) { out.push_str(&val.as_string()); }
             }
             Node::If { condition, then_body, else_body } => {
                 if let Some(TemplateValue::Bool(true)) = resolve_variable(condition, context) {
@@ -259,10 +252,9 @@ fn render_nodes(nodes: &[Node], context: &HashMap<String, TemplateValue>) -> Str
                 }
             }
             Node::For { var_name, list_name, body } => {
-                if let Some(TemplateValue::List(items)) = resolve_variable(list_name, context) {
+                if let Some(TemplateValue::List(items)) = resolve_variable(list_name, context).cloned() {
                     for item in items {
-                        let mut local = context.clone();
-                        local.insert(var_name.clone(), item.clone());
+                        let mut local = context.clone(); local.insert(var_name.clone(), item);
                         out.push_str(&render_nodes(body, &local));
                     }
                 }
@@ -271,6 +263,10 @@ fn render_nodes(nodes: &[Node], context: &HashMap<String, TemplateValue>) -> Str
                 out.push_str(&render_nodes(body, context));
             }
             Node::Extends(_) => {}
+            Node::Tailwind => {
+                tdebug!("Inserting Tailwind CDN link");
+                out.push_str(r#"<script src="https://cdn.tailwindcss.com"></script>"#);
+            }
         }
     }
     out
@@ -287,12 +283,8 @@ pub fn render_template(template_name: &str, context: &HashMap<String, TemplateVa
     let mut child_blocks = HashMap::new();
     let mut base_t: Option<String> = None;
     for node in &child_nodes {
-        if let Node::Extends(b) = node {
-            base_t = Some(b.clone());
-        }
-        if let Node::Block { name, body } = node {
-            child_blocks.insert(name.clone(), body.clone());
-        }
+        if let Node::Extends(b) = node { base_t = Some(b.clone()); }
+        if let Node::Block { name, body } = node { child_blocks.insert(name.clone(), body.clone()); }
     }
 
     // If extends, load base, merge and render
@@ -305,7 +297,7 @@ pub fn render_template(template_name: &str, context: &HashMap<String, TemplateVa
         tdebug!("Merged AST: {:?}", merged);
         html = render_nodes(&merged, context);
     } else {
-        // Otherwise, merge child blocks and render child directly
+        // Otherwise, merge child blocks and render directly
         let merged = merge_blocks(&child_nodes, &child_blocks);
         html = render_nodes(&merged, context)
     }
