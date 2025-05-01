@@ -1,0 +1,13 @@
+[package]
+name = "cobalto"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1"
+tokio = { version = "1.44", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+regex = "1.11.1"
+once_cell = "1.21.3"
