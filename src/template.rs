@@ -22,7 +22,7 @@ use log::debug;
 use crate::router::Response;
 
 /// Global switch for enabling/disabling internal template logs
-static DISPLAY_LOGS: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(true));
+static DISPLAY_LOGS: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
 
 /// Enable or disable internal debug logs for the template engine
 pub fn set_display_logs(enabled: bool) {

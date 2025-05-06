@@ -2,10 +2,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::future::Future;
 use std::pin::Pin;
+use axum::response::IntoResponse;
+use notify::event::DataChange;
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::time::Instant;
 use crate::settings::Settings;
+use notify::{EventKind, RecursiveMode, Watcher};
+use std::path::PathBuf;
+use tokio::sync::broadcast;
+use axum::extract::ws::{WebSocketUpgrade, Message};
+use std::net::SocketAddr;
+use axum::Router as AxumRouter;
+use axum::routing::get;
+use futures::StreamExt;
+use futures::SinkExt;
+use notify::event::ModifyKind::Data;
 
 pub struct Response {
     pub status_code: u16,
@@ -59,10 +71,12 @@ pub struct Route {
     pub middlewares: Vec<Middleware>,
 }
 
+#[derive(Clone)]
 pub struct Router {
     routes: Vec<Route>,
     middlewares: Vec<Middleware>,
     post_middlewares: Vec<PostMiddleware>,
+    pub reload_tx: Option<broadcast::Sender<String>>, // new field
 }
 
 async fn send_response(mut socket: tokio::net::TcpStream, response: Response) {
@@ -99,6 +113,7 @@ impl Router {
             routes: Vec::new(),
             middlewares: Vec::new(),
             post_middlewares: Vec::new(),
+            reload_tx: None,
         }
     }
 
@@ -118,10 +133,78 @@ impl Router {
         self.post_middlewares.push(middleware);
     }
 
-    pub async fn run(&self, settings: Settings) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn ws_reload_handler(self: Arc<Self>, ws: WebSocketUpgrade) -> impl IntoResponse {
+        ws.on_upgrade(move |socket| async move {
+            let (mut tx, _) = socket.split();
+            let mut rx = <Option<tokio::sync::broadcast::Sender<String>> as Clone>::clone(&self.reload_tx).expect("REASON").subscribe();
+    
+            log::info!("🔌 WebSocket client connected!");
+    
+            while let Ok(msg) = rx.recv().await {
+                if tx.send(Message::Text(msg.into())).await.is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
+    fn setup_ws_reload_watcher(&self, template_path: PathBuf, sender: broadcast::Sender<String>) {
+        tokio::spawn(async move {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+            let mut watcher = notify::recommended_watcher(move |res| {
+                let _ = tx.blocking_send(res);
+            }).expect("Failed to create watcher");
+    
+            watcher.watch(&template_path, RecursiveMode::Recursive).unwrap();
+    
+            while let Some(res) = rx.recv().await {
+                match res {
+                    Ok(event) => {
+                        if let EventKind::Modify(Data(DataChange::Content)) = event.kind {
+                            if let Some(path) = event.paths.first() {
+                                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                                    log::info!("📄 Template changed: {}", file_name);
+                                    let _ = sender.send("reload".to_string());
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => log::error!("Watch error: {:?}", e),
+                }
+            }
+        });
+    }
+    
+    pub async fn run(&mut self, settings: Settings) -> Result<(), Box<dyn std::error::Error>> {
         let addr_str = format!("{}:{}", settings.host, settings.port);
         let listener = TcpListener::bind(&addr_str).await?;
         println!("Server running on http://{}", addr_str);
+
+        // Setup WebSocket reload support if debug
+        if settings.debug {
+            let template_path = PathBuf::from(&settings.template.dir);
+            let (sender, _) = broadcast::channel::<String>(10);
+            self.reload_tx = Some(sender.clone());
+
+            self.setup_ws_reload_watcher(template_path, sender.clone());
+
+            let router = Arc::new(self.clone());
+            let app = AxumRouter::new().route(
+                "/ws/reload",
+                get(move |ws: WebSocketUpgrade| {
+                    let router = Arc::clone(&router);
+                    async move { router.ws_reload_handler(ws).await }
+                })
+            );
+
+            tokio::spawn(async move {
+                let socket_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+                let listener = TcpListener::bind(socket_addr).await.unwrap();
+                println!("WebSocket server running at ws://{}", socket_addr);
+                axum::serve(listener, app).await.unwrap();
+            });
+        }
+
         
         loop {
             let (mut socket, _) = listener.accept().await?;
