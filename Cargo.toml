@@ -2,6 +2,9 @@
 name = "cobalto"
 version = "0.1.0"
 edition = "2024"
+description = "A fast, batteries-included web framework for Rust, inspired by Django and Laravel."
+license = "MIT"
+repository = "https://github.com/cobaltoproject/cobalto"
 
 [dependencies]
 tokio = { version = "1.44", features = ["full"] }
