@@ -11,6 +11,7 @@ pub struct Settings {
     pub debug: bool,
     pub host: String,
     pub port: u16,
+    pub ws_port: u16,
     pub template: TemplateSettings,
     pub other: HashMap<String, String>, // Manteniamo eventuali future impostazioni
 }
