@@ -15,11 +15,13 @@
 use regex::Regex;
 use std::collections::HashMap;
 use std::fmt;
+use std::fmt::format;
 use std::sync::atomic::{AtomicBool, Ordering};
 use once_cell::sync::Lazy;
 use log::debug;
 
 use crate::router::Response;
+
 
 /// Global switch for enabling/disabling internal template logs
 static DISPLAY_LOGS: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
@@ -290,7 +292,9 @@ pub fn render_template(template_name: &str, context: &HashMap<String, TemplateVa
     // If extends, load base, merge and render
     let html: String;
     if let Some(base) = base_t {
-        let base_content = std::fs::read_to_string(format!("templates/{}", base)).unwrap();
+        let base_content = std::fs::read_to_string(
+            format!("templates/{}", base
+            )).unwrap_or(format!("Template '{}' not found", base));
         let base_nodes = parse_tokens(&tokenize_template(&base_content));
         tdebug!("Base AST: {:?}", base_nodes);
         let merged = merge_blocks(&base_nodes, &child_blocks);
