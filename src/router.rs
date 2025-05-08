@@ -1,3 +1,4 @@
+use crate::orm::Db;
 /// Cobalto Web Framework Router module
 ///
 /// This module provides the core routing, HTTP, and WebSocket infrastructure
@@ -28,6 +29,12 @@ use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub db: Arc<Db>,
+    pub settings: Settings,
+}
 
 /// Represents the outcome of an HTTP handler in Cobalto.
 /// Supports HTML, JSON, and custom status/headers.
@@ -112,7 +119,9 @@ pub struct RequestContext {
 /// Type alias for async handler functions for HTTP routes.
 /// Accepts a map of extracted parameters and returns a Response.
 pub type Handler = Arc<
-    dyn Fn(HashMap<String, String>) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync,
+    dyn Fn(HashMap<String, String>, AppState) -> Pin<Box<dyn Future<Output = Response> + Send>>
+        + Send
+        + Sync,
 >;
 
 /// Type alias for synchronous, pre-processing middleware executed before the handler.
@@ -160,6 +169,7 @@ pub struct Router {
     pub ws_routes: Vec<WsRoute>,
     pub middlewares: Vec<Middleware>,
     pub post_middlewares: Vec<PostMiddleware>,
+    pub app_state: Option<AppState>,
 }
 
 /// Serializes and sends an HTTP Response over a raw TCP socket connection.
@@ -200,6 +210,7 @@ impl Router {
             ws_routes: Vec::new(),
             middlewares: Vec::new(),
             post_middlewares: Vec::new(),
+            app_state: None,
         }
     }
 
@@ -233,6 +244,10 @@ impl Router {
     /// Add a post-middleware to be run after each HTTP handler.
     pub fn add_post_middleware(&mut self, middleware: PostMiddleware) {
         self.post_middlewares.push(middleware);
+    }
+
+    pub fn set_app_state(&mut self, state: AppState) {
+        self.app_state = Some(state);
     }
 
     /// Watches the template directory for changes; notifies via WS broadcast for live-reload.
@@ -306,7 +321,7 @@ impl Router {
             let routes = self.routes.clone();
             let middlewares = self.middlewares.clone();
             let post_middlewares = self.post_middlewares.clone();
-
+            let state = self.app_state.clone().expect("App state not set in Router");
             tokio::spawn(async move {
                 let mut buffer = [0; 1024];
                 if let Ok(_) = socket.read(&mut buffer).await {
@@ -345,7 +360,7 @@ impl Router {
                                     return;
                                 }
                             }
-                            response = (route.handler)(ctx.params.clone()).await;
+                            response = (route.handler)(ctx.params.clone(), state.clone()).await;
                             break;
                         }
                     }
@@ -456,7 +471,7 @@ macro_rules! route {
         $(
             $router.add_route(
                 $path,
-                Arc::new(|params| Box::pin($handler(params))),
+                Arc::new(move |params, state| Box::pin($handler(params, state.clone()))),
                 vec![$($middleware),*]
             );
         )*

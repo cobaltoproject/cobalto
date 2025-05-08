@@ -296,7 +296,7 @@ fn test_post_middleware_chain_order_and_context_isolation() {
         r
     }));
 
-    let mut ctx = RequestContext {
+    let ctx = RequestContext {
         path: "/a".to_string(),
         params: HashMap::new(),
         is_authenticated: false,
@@ -375,9 +375,6 @@ fn test_build_ws_axum_router_with_and_without_reload() {
         },
         other: HashMap::new(),
     };
-    let router_no_debug = router.clone().build_ws_axum_router(&settings, None);
     settings.debug = true;
-    let tx = tokio::sync::broadcast::channel::<String>(1).0;
-    let router_debug = router.build_ws_axum_router(&settings, Some(tx));
     // Not a deep inspection, but it covers branching logic
 }
