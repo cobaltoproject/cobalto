@@ -1,502 +1,357 @@
-use crate::orm::Db;
-/// Cobalto Web Framework Router module
-///
-/// This module provides the core routing, HTTP, and WebSocket infrastructure
-/// for Cobalto applications. It allows for:
-///
-/// - Path and parameter-based routing of traditional HTTP endpoints
-/// - Global and route-specific middleware (pre and post)
-/// - Unified, ergonomic registration of user-facing WebSocket endpoints on dedicated ports
-/// - Built-in support for hot-reload via special websocket route, with file watcher trigger
-///
-/// All API surfaces are designed to be "batteries-included" and make it fast and safe
-/// to build modern backends and real-time features alike.
-///
 use crate::settings::Settings;
-use axum::Router as AxumRouter;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::routing::get;
-use notify::event::DataChange;
-use notify::event::ModifyKind::Data;
-use notify::{EventKind, RecursiveMode, Watcher};
+use actix_web::{HttpRequest, HttpResponse, Responder, body::BoxBody};
+use serde::Serialize;
 use std::collections::HashMap;
-use std::future::Future;
-use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio::sync::broadcast;
 
-#[derive(Clone)]
-pub struct AppState {
-    pub db: Arc<Db>,
-    pub settings: Settings,
+pub struct Request {
+    pub params: HashMap<String, String>,
+    pub body: String,
 }
 
-/// Represents the outcome of an HTTP handler in Cobalto.
-/// Supports HTML, JSON, and custom status/headers.
-use serde::Serialize;
+impl Request {
+    pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
+        serde_json::from_str(&self.body)
+    }
+}
+
 pub struct Response {
-    pub status_code: u16,
+    pub status: u16,
     pub body: String,
     pub headers: HashMap<String, String>,
 }
 
+impl Responder for Response {
+    type Body = BoxBody;
+    fn respond_to(self, _req: &HttpRequest) -> HttpResponse<Self::Body> {
+        let mut res =
+            HttpResponse::build(actix_web::http::StatusCode::from_u16(self.status).unwrap());
+        for (k, v) in self.headers {
+            res.append_header((k, v));
+        }
+        res.body(self.body)
+    }
+}
+
 impl Response {
-    /// Construct a new HTTP 200 response with HTML/text body.
-    pub fn ok(body: impl Into<String>) -> Self {
-        Response {
-            status_code: 200,
+    /// HTML response with status 200 and HTML content type
+    pub fn html<B: Into<String>>(body: B) -> Self {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "Content-Type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        );
+        Self {
+            status: 200,
             body: body.into(),
-            headers: HashMap::new(),
+            headers,
         }
     }
 
-    /// Construct a new HTTP 403 response with text body.
-    pub fn forbidden(body: impl Into<String>) -> Self {
-        Response {
-            status_code: 403,
-            body: body.into(),
-            headers: HashMap::new(),
+    /// JSON response with status 200 and JSON content type
+    pub fn json<T: Serialize>(body: T) -> Self {
+        let body = serde_json::to_string(&body)
+            .unwrap_or_else(|_| "{\"error\": \"Failed to serialize body\"}".to_string());
+        let mut headers = HashMap::new();
+        headers.insert(
+            "Content-Type".to_string(),
+            "application/json; charset=utf-8".to_string(),
+        );
+        Self {
+            status: 200,
+            body,
+            headers,
         }
     }
 
-    /// Construct a new HTTP 404 "not found" response.
-    pub fn not_found() -> Self {
-        Response {
-            status_code: 404,
-            body: "404 Not Found".to_string(),
-            headers: HashMap::new(),
-        }
+    /// Builder for setting a different status code
+    pub fn with_status(mut self, status: u16) -> Self {
+        self.status = status;
+        self
     }
 
-    /// Construct a new HTTP JSON response.
-    /// Accepts any serde-serializable payload, status, and custom headers.
-    pub fn json<T: Serialize>(
-        data: T,
-        status_code: u16,
-        mut headers: HashMap<String, String>,
-    ) -> Self {
-        match serde_json::to_string(&data) {
-            Ok(body) => {
-                headers.insert(
-                    "Content-Type".to_string(),
-                    "application/json; charset=utf-8".to_string(),
-                );
-                Response {
-                    status_code,
-                    body,
-                    headers,
-                }
-            }
-            Err(_) => {
-                headers.insert(
-                    "Content-Type".to_string(),
-                    "application/json; charset=utf-8".to_string(),
-                );
-                Response {
-                    status_code: 500,
-                    body: "{\"error\": \"Serialization failed\"}".to_string(),
-                    headers,
-                }
-            }
-        }
+    /// Builder for adding or overwriting a header
+    pub fn add_header<S: Into<String>>(mut self, key: S, val: S) -> Self {
+        self.headers.insert(key.into(), val.into());
+        self
     }
 }
 
-/// Holds metadata about the current HTTP request and its extracted path parameters.
-/// Middleware and handlers can modify/read this context.
-pub struct RequestContext {
-    pub path: String,
-    pub params: HashMap<String, String>,
-    pub is_authenticated: bool,
-    pub start_time: Option<Instant>,
-}
+/// Handler type—expand as needed for params/state later!
+pub type Handler =
+    Arc<dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync>;
 
-/// Type alias for async handler functions for HTTP routes.
-/// Accepts a map of extracted parameters and returns a Response.
-pub type Handler = Arc<
-    dyn Fn(HashMap<String, String>, AppState) -> Pin<Box<dyn Future<Output = Response> + Send>>
-        + Send
-        + Sync,
->;
-
-/// Type alias for synchronous, pre-processing middleware executed before the handler.
-/// If a middleware returns Some(Response), request handling stops and this response is sent.
-pub type Middleware = Arc<dyn Fn(&mut RequestContext) -> Option<Response> + Send + Sync>;
-
-/// Type alias for post-processing middleware executed after the handler.
-/// Post-middleware can inspect/modify the response before it is sent.
-pub type PostMiddleware = Arc<dyn Fn(&RequestContext, Response) -> Response + Send + Sync>;
-
-/// Represents a registered HTTP route and its associated handler + middleware.
 #[derive(Clone)]
 pub struct Route {
-    pub path_pattern: String,
-    pub handler: Handler,
-    pub middlewares: Vec<Middleware>,
-}
-
-/// Context for user WebSocket handlers, providing matched path and params.
-#[derive(Clone)]
-pub struct WsContext {
+    pub method: String,
     pub path: String,
-    pub params: HashMap<String, String>,
+    pub handler: Handler,
+    pub handler_name: String,
 }
 
-/// Async handler type for WebSocket routes.
-/// Accepts WsContext and an Axum WebSocket stream for two-way comms.
-pub type WsHandler =
-    Arc<dyn Fn(WsContext, WebSocket) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
-
-/// Represents a registered user WebSocket route and its associated handler.
-#[derive(Clone)]
-pub struct WsRoute {
-    pub path_pattern: String,
-    pub handler: WsHandler,
-}
-
-// Settings struct changes: expects both http_port and ws_port in Settings
-
-/// The main application router for Cobalto.
-/// Manages all HTTP routes, WebSocket routes, and global middleware.
-#[derive(Clone)]
+/// The Cobalto router is just a list of registered routes for now.
 pub struct Router {
     pub routes: Vec<Route>,
-    pub ws_routes: Vec<WsRoute>,
-    pub middlewares: Vec<Middleware>,
-    pub post_middlewares: Vec<PostMiddleware>,
-    pub app_state: Option<AppState>,
-}
-
-/// Serializes and sends an HTTP Response over a raw TCP socket connection.
-async fn send_response(mut socket: tokio::net::TcpStream, response: Response) {
-    let mut headers = String::new();
-    for (key, value) in response.headers {
-        headers.push_str(&format!("{}: {}\r\n", key, value));
-    }
-
-    let response_text = format!(
-        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\n{}\
-\r\n{}",
-        response.status_code,
-        status_text(response.status_code),
-        response.body.len(),
-        headers,
-        response.body
-    );
-
-    let _ = socket.write_all(response_text.as_bytes()).await;
-}
-
-/// Maps status codes to HTTP status text for responses.
-pub fn status_text(code: u16) -> &'static str {
-    match code {
-        200 => "OK",
-        403 => "Forbidden",
-        404 => "Not Found",
-        _ => "Unknown",
-    }
+    pub settings: Settings,
 }
 
 impl Router {
-    /// Create a new, empty application router.
-    pub fn new() -> Self {
+    pub fn new(settings: Settings) -> Self {
         Router {
             routes: Vec::new(),
-            ws_routes: Vec::new(),
-            middlewares: Vec::new(),
-            post_middlewares: Vec::new(),
-            app_state: None,
+            settings,
         }
     }
 
-    /// Register an HTTP route with path pattern, handler, and any route-specific middleware.
-    pub fn add_route(
-        &mut self,
-        path_pattern: &str,
-        handler: Handler,
-        middlewares: Vec<Middleware>,
-    ) {
+    /// Register a route.
+    pub fn add_route(&mut self, method: &str, path: &str, handler: Handler, handler_name: &str) {
         self.routes.push(Route {
-            path_pattern: path_pattern.to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
             handler,
-            middlewares,
+            handler_name: handler_name.to_string(),
         });
     }
 
-    /// Register a WebSocket route and handler.
-    pub fn add_websocket(&mut self, path_pattern: &str, handler: WsHandler) {
-        self.ws_routes.push(WsRoute {
-            path_pattern: path_pattern.to_string(),
-            handler,
-        });
+    /// List all registered routes as (method, path) strings.
+    pub fn list_routes(&self) -> Vec<(String, String)> {
+        self.routes
+            .iter()
+            .map(|r| (r.method.clone(), r.path.clone()))
+            .collect()
     }
 
-    /// Add a global pre-middleware to be run before all HTTP handlers.
-    pub fn add_middleware(&mut self, middleware: Middleware) {
-        self.middlewares.push(middleware);
-    }
+    pub async fn run(&self) -> std::io::Result<()> {
+        let bind_addr = format!("{}:{}", self.settings.host, self.settings.port);
+        let app_state = self.settings.clone();
+        let routes = self.routes.clone();
 
-    /// Add a post-middleware to be run after each HTTP handler.
-    pub fn add_post_middleware(&mut self, middleware: PostMiddleware) {
-        self.post_middlewares.push(middleware);
-    }
-
-    pub fn set_app_state(&mut self, state: AppState) {
-        self.app_state = Some(state);
-    }
-
-    /// Watches the template directory for changes; notifies via WS broadcast for live-reload.
-    fn setup_ws_reload_watcher(&self, template_path: PathBuf, sender: broadcast::Sender<String>) {
-        tokio::spawn(async move {
-            let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-            let mut watcher = notify::recommended_watcher(move |res| {
-                let _ = tx.blocking_send(res);
-            })
-            .expect("Failed to create watcher");
-
-            watcher
-                .watch(&template_path, RecursiveMode::Recursive)
-                .unwrap();
-
-            while let Some(res) = rx.recv().await {
-                match res {
-                    Ok(event) => {
-                        if let EventKind::Modify(Data(DataChange::Content)) = event.kind {
-                            if let Some(path) = event.paths.first() {
-                                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                                    log::info!("📄 Template changed: {}", file_name);
-                                    let _ = sender.send("reload".to_string());
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => log::error!("Watch error: {:?}", e),
-                }
-            }
-        });
-    }
-
-    /// Orchestrate the entire application by launching both HTTP and WebSocket servers
-    /// on their respective ports, as provided in the Settings.
-    ///
-    /// This is the typical entry point for production use.
-    pub async fn run(
-        &mut self,
-        settings: Settings,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut ws_self = self.clone();
-        let mut http_self = self.clone();
-
-        let http_addr = format!("{}:{}", settings.host, settings.port); // or settings.http_port
-        let ws_addr = format!("{}:{}", settings.host, settings.ws_port);
-
-        let ws_settings = settings.clone();
-
-        // Start WS on a separate task
-        let ws_handle = tokio::spawn(async move { ws_self.run_ws(&ws_addr, ws_settings).await });
-
-        http_self.run_http(&http_addr, settings).await?;
-
-        ws_handle.await??;
-        Ok(())
-    }
-
-    /// Start the HTTP server for standard GET/POST etc. endpoints.
-    /// Uses a classic TcpListener and manual HTTP parsing for fine-grained control.
-    pub async fn run_http(
-        &mut self,
-        addr: &str,
-        _settings: Settings,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let listener = TcpListener::bind(addr).await?;
-        println!("HTTP Server running on http://{}", addr);
-
-        loop {
-            let (mut socket, _) = listener.accept().await?;
-            let routes = self.routes.clone();
-            let middlewares = self.middlewares.clone();
-            let post_middlewares = self.post_middlewares.clone();
-            let state = self.app_state.clone().expect("App state not set in Router");
-            tokio::spawn(async move {
-                let mut buffer = [0; 1024];
-                if let Ok(_) = socket.read(&mut buffer).await {
-                    let request = String::from_utf8_lossy(&buffer[..]);
-                    let first_line = request.lines().next().unwrap_or_default();
-                    let path = first_line.split_whitespace().nth(1).unwrap_or("/");
-
-                    let parts: Vec<&str> = path.split('?').collect();
-                    let real_path = parts[0];
-                    let mut ctx = RequestContext {
-                        path: real_path.to_string(),
-                        params: HashMap::new(),
-                        is_authenticated: parts
-                            .get(1)
-                            .map(|q| q.contains("token=abc123"))
-                            .unwrap_or(false),
-                        start_time: None,
-                    };
-
-                    for middleware in &middlewares {
-                        if let Some(response) = (middleware)(&mut ctx) {
-                            send_response(socket, response).await;
-                            return;
-                        }
-                    }
-
-                    let mut response = Response::not_found();
-
-                    for route in &routes {
-                        if let Some(params) = match_path(&route.path_pattern, &ctx.path) {
-                            ctx.params = params;
-
-                            for middleware in &route.middlewares {
-                                if let Some(response) = (middleware)(&mut ctx) {
-                                    send_response(socket, response).await;
-                                    return;
-                                }
-                            }
-                            response = (route.handler)(ctx.params.clone(), state.clone()).await;
-                            break;
-                        }
-                    }
-
-                    for post_middleware in &post_middlewares {
-                        response = (post_middleware)(&ctx, response);
-                    }
-
-                    send_response(socket, response).await;
-                }
-            });
-        }
-    }
-
-    /// Build an Axum router for all registered WebSocket routes and the optional hot-reload route.
-    /// Called only from run_ws().
-    pub fn build_ws_axum_router(
-        &mut self,
-        settings: &Settings,
-        reload_sender: Option<broadcast::Sender<String>>,
-    ) -> AxumRouter {
-        let mut app = AxumRouter::new();
-
-        // Add all user-defined websocket routes
-        for ws_route in &self.ws_routes {
-            let ws_path = ws_route.path_pattern.clone();
-            let ws_handler = ws_route.handler.clone();
-            let ws_path_for_route = ws_path.clone();
-            app = app.route(
-                &ws_path,
-                get(move |ws: WebSocketUpgrade| {
-                    let ws_handler = ws_handler.clone();
-                    let ws_path = ws_path_for_route.clone(); // move in for this closure
-                    async move {
-                        ws.on_upgrade(move |socket| {
-                            (ws_handler)(
-                                WsContext {
-                                    path: ws_path.clone(),
-                                    params: HashMap::new(),
-                                },
-                                socket,
-                            )
-                        })
-                    }
-                }),
+        // Log all registered routes at startup
+        println!("╭──────────────────── Registered Routes ────────────────────╮");
+        for route in &self.routes {
+            println!(
+                "│   {:<6}  {}  (fn: {})",
+                route.method, route.path, route.handler_name
             );
         }
+        println!("╰───────────────────────────────────────────────────────────╯");
+        println!("Cobalto router serving on http://{}", bind_addr);
 
-        // Add hot-reload websocket if enabled
-        if settings.debug {
-            let tx = reload_sender;
-            app = app.route(
-                "/ws/reload",
-                get(move |ws: WebSocketUpgrade| {
-                    let tx = tx.clone();
-                    async move {
-                        ws.on_upgrade(move |mut socket| async move {
-                            if let Some(tx) = tx {
-                                let mut rx = tx.subscribe();
-                                log::info!("🔌 Hot Reload WebSocket client connected!");
-                                while let Ok(msg) = rx.recv().await {
-                                    if socket.send(Message::Text(msg.into())).await.is_err() {
-                                        break;
+        actix_web::HttpServer::new(move || {
+            // Create App with app_data up front
+            let app = actix_web::App::new().app_data(actix_web::web::Data::new(app_state.clone()));
+
+            // Fold over all routes, chaining .route calls
+            let route_paths: Vec<(String, Vec<String>)> = routes
+                .iter()
+                .fold(HashMap::new(), |mut map, route| {
+                    map.entry(route.path.clone())
+                        .or_insert(vec![])
+                        .push(route.method.clone());
+                    map
+                })
+                .into_iter()
+                .collect();
+
+            let app = routes
+                .iter()
+                .fold(app, |app, route| {
+                    let path_pattern = route.path.clone();
+                    let handler = route.handler.clone();
+                    let method = route.method.clone();
+
+                    app.route(
+                        "/{tail:.*}",
+                        actix_web::web::route()
+                            .guard(actix_web::guard::fn_guard({
+                                let pattern = path_pattern.clone();
+                                let method = method.clone();
+                                move |ctx| {
+                                    // Check HTTP method and path pattern
+                                    let req = ctx.head();
+                                    let req_method = req.method.as_str();
+                                    let req_path = req.uri.path();
+                                    req_method == method
+                                        && extract_path_params(&pattern, req_path).is_some()
+                                }
+                            }))
+                            .to({
+                                let path_pattern = path_pattern.clone();
+                                let handler = handler.clone();
+                                move |req: HttpRequest, body: actix_web::web::Bytes| {
+                                    let path_pattern = path_pattern.clone();
+                                    let handler = handler.clone();
+                                    async move {
+                                        let params = extract_path_params(&path_pattern, req.path())
+                                            .unwrap_or_default();
+                                        let body_str =
+                                            String::from_utf8(body.to_vec()).unwrap_or_default();
+                                        let request = Request {
+                                            params: params.clone(),
+                                            body: body_str,
+                                        };
+
+                                        let t0 = std::time::Instant::now();
+                                        let response = (handler)(request).await;
+                                        let elapsed = t0.elapsed().as_millis();
+
+                                        let now = chrono::Local::now();
+                                        let ip = req
+                                            .headers()
+                                            .get("x-forwarded-for")
+                                            .and_then(|hv| hv.to_str().ok())
+                                            .map(|s| {
+                                                s.split(',').next().unwrap_or(s).trim().to_string()
+                                            })
+                                            .or_else(|| req.peer_addr().map(|a| a.ip().to_string()))
+                                            .unwrap_or_else(|| "<unknown>".to_string());
+                                        println!(
+                                            "[{}] {} {} {} [{}ms, {}]",
+                                            now.format("%Y-%m-%d %H:%M:%S"),
+                                            req.method(),
+                                            req.path(),
+                                            response.status,
+                                            elapsed,
+                                            ip,
+                                        );
+                                        response
                                     }
                                 }
+                            }),
+                    )
+                })
+                .default_service(actix_web::web::to({
+                    let route_paths = route_paths.clone();
+                    move |req: HttpRequest| {
+                        let route_paths = route_paths.clone();
+                        async move {
+                            let req_path = req.path();
+                            let req_method = req.method().as_str().to_string();
+                            // Find if path matches any known route (regardless of method)
+                            let matched = route_paths
+                                .iter()
+                                .find(|(path, _)| {
+                                    // Use extract_path_params logic for pattern match
+                                    extract_path_params(path, req_path).is_some()
+                                });
+
+                            let ip = req
+                                .headers()
+                                .get("x-forwarded-for")
+                                .and_then(|hv| hv.to_str().ok())
+                                .map(|s| {
+                                    s.split(',').next().unwrap_or(s).trim().to_string()
+                                })
+                                .or_else(|| req.peer_addr().map(|a| a.ip().to_string()))
+                                .unwrap_or_else(|| "<unknown>".to_string());
+                            let now = chrono::Local::now();
+
+                            if let Some((_, allowed_methods)) = matched {
+                                // Path matches but method does not
+                                println!(
+                                    "[{}] {} {} 404 [{}]",
+                                    now.format("%Y-%m-%d %H:%M:%S"),
+                                    req.method(),
+                                    req.path(),
+                                    ip,
+                                );
+                                let accept = req
+                                    .headers()
+                                    .get("accept")
+                                    .and_then(|h| h.to_str().ok())
+                                    .unwrap_or("");
+                                let allow_methods = allowed_methods.join("\", \"");
+
+                                if accept.contains("application/json") {
+                                    HttpResponse::NotFound()
+                                        .content_type("application/json; charset=utf-8")
+                                        .body(format!(r#"{{"error":"Method '{}' not allowed.", "Allowed": ["{}"],"status":404}}"#, req_method, allow_methods))
+                                } else {
+                                    HttpResponse::NotFound()
+                                        .content_type("text/html; charset=utf-8")
+                                        .body(format!(r#"<!DOCTYPE html>
+                                            <html lang="en">
+                                            <head><meta charset="utf-8"><title>404 Not Found</title></head>
+                                            <body style="font-family:sans-serif;text-align:center;margin-top:10vh">
+                                            <h1 style="font-size:4rem;margin-bottom:0.5em">404</h1>
+                                            <p style="font-size:1.5rem;margin-bottom:2em">Method <b>{}</b> not allowed.<br>Allowed methods: [{}]</p>
+                                            </body>
+                                            </html>
+                                            "#, req_method, allow_methods))
+                                }
+                            } else {
+                                // True 404, fallthrough to next (the actual 404 handler)
+                                let accept = req
+                                    .headers()
+                                    .get("accept")
+                                    .and_then(|h| h.to_str().ok())
+                                    .unwrap_or("");
+                                println!(
+                                    "[{}] {} {} 404 [{}]",
+                                    now.format("%Y-%m-%d %H:%M:%S"),
+                                    req.method(),
+                                    req.path(),
+                                    ip,
+                                );
+                                if accept.contains("application/json") {
+                                    HttpResponse::NotFound()
+                                        .content_type("application/json; charset=utf-8")
+                                        .body(r#"{"error":"Not found","status":404}"#)
+                                } else {
+                                    HttpResponse::NotFound()
+                                        .content_type("text/html; charset=utf-8")
+                                        .body(
+                                            r#"<!DOCTYPE html>
+                                            <html lang="en">
+                                            <head><meta charset="utf-8"><title>404 Not Found</title></head>
+                                            <body style="font-family:sans-serif;text-align:center;margin-top:10vh">
+                                            <h1 style="font-size:4rem;margin-bottom:0.5em">404</h1>
+                                            <p style="font-size:1.5rem;margin-bottom:2em">Page not found</p>
+                                            </body>
+                                            </html>
+                                            "#
+                                        )
+                                }
                             }
-                        })
+                        }
                     }
-                }),
-            );
-        }
-
-        app
+                }));
+            app
+        })
+        .bind(bind_addr)?
+        .run()
+        .await
     }
+}
 
-    /// Start the WebSocket server, registering both user endpoints and hot-reload if enabled.
-    /// Uses Axum and Hyper for WebSocket protocol handling.
-    pub async fn run_ws(
-        &mut self,
-        addr: &str,
-        settings: Settings,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        use axum::serve;
-        use tokio::net::TcpListener;
-
-        let mut reload_sender = None;
-        if settings.debug {
-            let template_path = PathBuf::from(&settings.template.dir);
-            let (sender, _) = broadcast::channel::<String>(10);
-            reload_sender = Some(sender.clone());
-            self.setup_ws_reload_watcher(template_path, sender);
-        }
-
-        let app = self.build_ws_axum_router(&settings, reload_sender);
-
-        let addr: SocketAddr = addr.parse()?;
-        let listener = TcpListener::bind(addr).await?;
-        println!("WebSocket Server running at ws://{}", addr);
-
-        serve(listener, app).await?;
-        Ok(())
+fn extract_path_params(pattern: &str, path: &str) -> Option<HashMap<String, String>> {
+    let pattern_parts: Vec<_> = pattern.trim_matches('/').split('/').collect();
+    let path_parts: Vec<_> = path.trim_matches('/').split('/').collect();
+    if pattern_parts.len() != path_parts.len() {
+        return None;
     }
+    let mut params = HashMap::new();
+    for (p, actual) in pattern_parts.iter().zip(path_parts.iter()) {
+        if p.starts_with(':') {
+            params.insert(p[1..].to_string(), actual.to_string());
+        } else if *p != *actual {
+            return None;
+        }
+    }
+    Some(params)
 }
 
 #[macro_export]
 macro_rules! route {
-    ($router:expr, $( $method:ident $path:expr => { $handler:expr $(, $middleware:expr )* } ),* $(,)?) => {
+    ($router:expr, $( $method:ident $path:expr => $handler:expr ),* $(,)?) => {
         $(
             $router.add_route(
+                stringify!($method),
                 $path,
-                Arc::new(move |params, state| Box::pin($handler(params, state.clone()))),
-                vec![$($middleware),*]
+                Arc::new(|req| Box::pin($handler(req))),
+                stringify!($handler)
             );
         )*
     };
-}
-
-/// Matches a path pattern (e.g. `/foo/:id`) against a real path,
-/// extracting parameters into a HashMap if matched, or None if not.
-pub fn match_path(pattern: &str, path: &str) -> Option<HashMap<String, String>> {
-    let pattern_parts: Vec<&str> = pattern.trim_matches('/').split('/').collect();
-    let path_parts: Vec<&str> = path.trim_matches('/').split('/').collect();
-
-    if pattern_parts.len() != path_parts.len() {
-        return None;
-    }
-
-    let mut params = HashMap::new();
-
-    for (p, a) in pattern_parts.iter().zip(path_parts.iter()) {
-        if p.starts_with(':') {
-            params.insert(p[1..].to_string(), a.to_string());
-        } else if p != a {
-            return None;
-        }
-    }
-
-    Some(params)
 }
